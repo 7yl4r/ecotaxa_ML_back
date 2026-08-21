@@ -26,6 +26,7 @@ class PredictionReq:
             except (TypeError, ValueError):
                 continue
         self.pre_mapping = normalized_pre_mapping
+        self.test_fraction: float = kwargs.get("test_fraction", 0.0)
 
     def dict(self):
         return self.__dict__

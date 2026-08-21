@@ -8,9 +8,10 @@
 # - Use the trained classifier on the target project.
 #
 from collections import Counter
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
+from sklearn.model_selection import train_test_split  # type: ignore
 
 from BO.Classification import ClassifIDListT
 from BO.ObjectSet import DescribedObjectSet, EnumeratedObjectSet
@@ -21,6 +22,7 @@ from BO.Rights import RightsBO, Action
 from BO.Training import TrainingBO
 from DB.Object import ObjectIDListT
 from DB.Project import ProjectIDT, Project
+from DB.Taxonomy import Taxonomy
 from DB.helpers import Result
 from DB.helpers.Direct import text
 from DB.helpers.SQL import SelectClause
@@ -78,6 +80,11 @@ class GPUPredictForProject(PredictForProject):
             self.report_ls_too_large(ls_size)
             return
 
+        evaluation = None
+        if req.test_fraction and req.test_fraction > 0:
+            self.update_progress(15, "Evaluating classifier on held-out test split")
+            evaluation = self.evaluate_split(np_feature_vals, classif_ids)
+
         training = TrainingBO.create_one(
             self.session, user.id, f"Prediction in {tgt_prj.projid}"
         )
@@ -93,8 +100,113 @@ class GPUPredictForProject(PredictForProject):
 
         final_message = "New category set on %d objects." % nb_rows
         self.update_progress(100, final_message)
-        done_infos = {"rowcount": nb_rows}
+        done_infos: Dict[str, Any] = {"rowcount": nb_rows}
+        if evaluation is not None:
+            done_infos["evaluation"] = evaluation
         self.set_job_result(errors=[], infos=done_infos)
+
+    def evaluate_split(
+        self, np_feature_vals: np.ndarray, classif_ids: ClassifIDListT
+    ) -> Dict[str, Any]:
+        """
+        Hold out a stratified fraction of the learning set (per category) to report
+        accuracy before the classifier is used for real. This is reporting-only:
+        the classifier actually deployed (@see build_classifier) is trained
+        separately, on the full learning set, regardless of this evaluation.
+        """
+        test_fraction = self.req.test_fraction
+        classif_ids_arr = np.array(classif_ids)
+        counts = Counter(classif_ids_arr.tolist())
+        excluded = sorted({int(c) for c, n in counts.items() if n < 2})
+        keep_classes = {c for c, n in counts.items() if n >= 2}
+
+        if len(keep_classes) < 2:
+            return {
+                "overall_accuracy": None,
+                "macro_accuracy": None,
+                "train_size": 0,
+                "test_size": 0,
+                "per_taxon": [],
+                "excluded_categories": excluded,
+                "note": "Not enough validated objects per category to evaluate.",
+            }
+
+        mask = np.isin(classif_ids_arr, list(keep_classes))
+        eval_features = np_feature_vals[mask]
+        eval_classif = classif_ids_arr[mask]
+
+        try:
+            train_X, test_X, train_y, test_y = train_test_split(
+                eval_features,
+                eval_classif,
+                test_size=test_fraction,
+                stratify=eval_classif,
+                random_state=42,
+            )
+        except ValueError as e:
+            # Some category is too small relative to test_fraction for sklearn's
+            # stratified split to place at least one example of it in each side.
+            logger.warning("Stratified split failed (%s), falling back to unstratified", e)
+            train_X, test_X, train_y, test_y = train_test_split(
+                eval_features, eval_classif, test_size=test_fraction, random_state=42
+            )
+
+        eval_classifier = OurRandomForestClassifier()
+        eval_classifier.learn_from(train_X, train_y.tolist())
+        pred_ids, _scores = eval_classifier.predict(test_X)
+        pred_y = np.array(pred_ids)
+
+        per_taxon_counts: Dict[int, Dict[str, int]] = {}
+        for true_id, pred_id in zip(test_y.tolist(), pred_y.tolist()):
+            entry = per_taxon_counts.setdefault(true_id, {"support": 0, "correct": 0})
+            entry["support"] += 1
+            if true_id == pred_id:
+                entry["correct"] += 1
+
+        names: Dict[int, str] = {}
+        if per_taxon_counts:
+            rows = (
+                self.ro_session.query(Taxonomy)
+                .filter(Taxonomy.id.in_(list(per_taxon_counts.keys())))
+                .all()
+            )
+            names = {row.id: (row.display_name or row.name) for row in rows}
+
+        per_taxon = []
+        for taxon_id, c in per_taxon_counts.items():
+            accuracy = c["correct"] / c["support"]
+            per_taxon.append(
+                {
+                    "classif_id": int(taxon_id),
+                    "name": names.get(taxon_id, str(taxon_id)),
+                    "support": c["support"],
+                    "correct": c["correct"],
+                    "accuracy": round(accuracy, 4),
+                }
+            )
+        per_taxon.sort(key=lambda r: -r["support"])
+
+        total_support = len(test_y)
+        total_correct = int((pred_y == test_y).sum())
+        overall_accuracy = total_correct / total_support if total_support else None
+        macro_accuracy = (
+            sum(r["accuracy"] for r in per_taxon) / len(per_taxon)
+            if per_taxon
+            else None
+        )
+
+        return {
+            "overall_accuracy": round(overall_accuracy, 4)
+            if overall_accuracy is not None
+            else None,
+            "macro_accuracy": round(macro_accuracy, 4)
+            if macro_accuracy is not None
+            else None,
+            "train_size": int(len(train_y)),
+            "test_size": int(total_support),
+            "per_taxon": per_taxon,
+            "excluded_categories": excluded,
+        }
 
     def report_ls_too_large(self, ls_size: int) -> None:
         logger.error(
